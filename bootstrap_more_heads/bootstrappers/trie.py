@@ -8,20 +8,19 @@ import typing
 from collections import Counter, defaultdict
 from functools import reduce
 from itertools import chain, compress, cycle
-
 from pprint import pprint as pp
+
 import ijson
 import numpy as np
 import orjson
+import regex
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
-
-import regex
 
 
 def bootstrap(
     fps: list[pathlib.Path],
-    seed_centre_patterns: list[str],
+    seed_centres: list[str],
     seed_contexts: list[str],
     contexts_ignore: list[
         str
@@ -59,20 +58,11 @@ def bootstrap(
     """
 
     modifiers_count_by_head = defaultdict(Counter)
-    modifiers_location_by_head = defaultdict(lambda: defaultdict(list))
-    doc_label2i = {}
+    modifiers_loc_by_head = defaultdict(lambda: defaultdict(list))
+    loc2i = {}
 
     ## 1) mine new contexts coincident with passed seed_centre_patterns, and combine with seed_contexts
-    if len(seed_centre_patterns) > 0:
-
-        # build pattern for extracting modifiers
-        trie = Trie()
-        for pattern in seed_centre_patterns:
-            trie.add(pattern)
-        if ignore_hyphen == True:
-            p = "(.+?)-*" + trie.pattern()
-        else:
-            p = "(.+?)" + trie.pattern()
+    if len(seed_centres) > 0:
 
         print(f"\tgetting modifiers corresponding to seed head patterns")
         unmined_modifiers: set[str] = set(seed_contexts).union(
@@ -80,7 +70,7 @@ def bootstrap(
                 get_modifiers_star,
                 zip(
                     fps,
-                    cycle([p]),
+                    cycle([seed_centres]),
                     range(len(fps)),
                 ),
                 max_workers=n_processes,
@@ -117,22 +107,14 @@ def bootstrap(
     ## 3) mine new heads, which are coincident with filtered modifiers
     if len(kept_modifiers) > 0:
 
-        trie = Trie()
-        for modifier in kept_modifiers:
-            trie.add(f"{re.escape(modifier)}")
-        if ignore_hyphen:
-            p = trie.pattern() + "-*(.+)"
-        else:
-            p = trie.pattern() + "(?!-)(.+)"
-
         # get all heads which match against unmined modifiers
         print(f"\tgetting heads corresponding to modifiers")
-        bootstrapped_heads: set = set.union(
+        bootstrapped_heads: set = set(seed_centres).union(
             *process_map(
                 get_heads_star,
                 zip(
                     fps,
-                    cycle([p]),
+                    cycle([kept_modifiers]),
                     range(len(fps)),
                 ),
                 max_workers=n_processes,
@@ -152,30 +134,19 @@ def bootstrap(
         with open(output_dir / "bootstrapped__discarded_heads.txt", "w") as f:
             f.writelines([head + "\n" for head in bootstrapped_heads - kept_heads])
 
-        # 4)
+        # 4)  get head->modifier->loc data for set of original seed heads, plus bootstrapped heads
         print(f"\tget dicts")
 
-        trie = Trie()
-        for head in kept_heads:
-            trie.add(f"{re.escape(head)}")
-        if ignore_hyphen:
-            p = "(.+?)-*" + f"({trie.pattern()})"
-        else:
-            p = "(.+)" + f"({trie.pattern()})"
-
-        # process map splits creates splits of modifiers_count_by_head ... etc,
-        # according to fps splits
         (
-            modifiers_count_by_head_iter,  # [{head: {modifier: count, ...}, ..}, ...]
-            modifiers_location_by_head_iter,  # [{head: {modifier: ["http://kb...", ...], ...}, ...}, ...]
-            doc_label2i_iter,  # [{"http://kb...": 0, ...}, ...]
+            modifiers_loc_by_head_iter,  # [{head: {modifier: [0, ...], ...}, ...}, ...]
+            loc2i_iter,  # [{"http://kb...": 0, ...}, ...]
         ) = list(
             zip(
                 *process_map(
-                    get_modifiers_count_by_head_star,
+                    get_modifiers_by_head_star,
                     zip(
                         fps,
-                        cycle([p]),
+                        cycle([kept_heads]),
                         cycle([word_set]),
                         range(len(fps)),
                     ),
@@ -188,57 +159,65 @@ def bootstrap(
         print(f"\tstitch the dicts")
 
         # join the modifiers_count_by_head splits
-        modifiers_count_by_head = defaultdict(Counter)
-        for modifiers_count_by_head_split in modifiers_count_by_head_iter:
-            for head, modifiers_counter in modifiers_count_by_head_split.items():
-                for modifier, count in modifiers_counter.items():
-                    modifiers_count_by_head[head][modifier] += count
-
-        # join the modifiers_count_by_head splits
-        modifiers_location_by_head = defaultdict(lambda: defaultdict(list))
-        doc_label2i = {}
-        for j, (modifiers_location_by_head_split, doc_label2i_split) in enumerate(
-            zip(modifiers_location_by_head_iter, doc_label2i_iter)
+        modifiers_count_by_head = defaultdict(lambda: defaultdict(int))
+        modifiers_loc_by_head = defaultdict(lambda: defaultdict(list))
+        loc2i = {}
+        for j, (modifiers_loc_by_head_split, loc2i_split) in enumerate(
+            zip(modifiers_loc_by_head_iter, loc2i_iter)
         ):
 
-            i2doc_label = {i: doc_label for doc_label, i in doc_label2i_split.items()}
+            i2loc_split = {i: doc_label for doc_label, i in loc2i_split.items()}
 
-            for head, modifiers_loc in modifiers_location_by_head_split.items():
-                for modifier, doc_indices in modifiers_loc.items():
-                    for i in doc_indices:
+            for head, modifiers_loc in modifiers_loc_by_head_split.items():
+                for modifier, loc_indices in modifiers_loc.items():
 
-                        doc_label = i2doc_label[i]
+                    for i in loc_indices:
+
+                        doc_label = i2loc_split[i]
 
                         # reassign i
                         new_i = j + i
 
                         # update
-                        doc_label2i[doc_label] = new_i
-                        modifiers_location_by_head[head][modifier].append(new_i)
+                        loc2i[doc_label] = new_i
+                        modifiers_loc_by_head[head][modifier].append(new_i)
 
-    return (modifiers_count_by_head, modifiers_location_by_head, doc_label2i)
+        # build modifiers_count_by_head
+        print("building modifiers_count_by_head")
+        for head in modifiers_loc_by_head.keys():
+            for modifier, locations in modifiers_loc_by_head[head].items():
+                modifiers_count_by_head[head][modifier] += len(locations)
+
+    return (modifiers_count_by_head, modifiers_loc_by_head, loc2i)
 
 
-def get_modifiers_count_by_head_star(t):
-    return get_modifier_count_by_head(*t)
+def get_modifiers_by_head_star(t):
+    return get_modifiers_by_head(*t)
 
 
-def get_modifier_count_by_head(
+def get_modifiers_by_head(
     fp: pathlib.Path,
-    pattern: str,
+    seed_heads: list[str],
     word_set: set,
     pbar_position: int,
 ):
-    """Return tuple of dicts (modifiers_count_by_head, modifiers_location_by_head, doc_label2i)"""
+    """Return tuple of dicts (modifiers_location_by_head, doc_label2i)"""
 
-    modifiers_count_by_head = defaultdict(Counter)
     modifiers_location_by_head = defaultdict(lambda: defaultdict(list))
     doc_label2i = T2i()
+
+    trie = RevTrie()
+
+    # build Trie capable of extracting modifiers
+    doc_label2i = T2i()
+    noun2i = defaultdict(list)
 
     fp_items = gen_items([fp])
     for item in tqdm(fp_items, desc=str(pbar_position), position=pbar_position):
 
         doc_label, doc_stuff = item
+        doc_label2i.append(doc_label)
+        i = doc_label2i[doc_label]
 
         for sentence_text, sentence_parse in doc_stuff:
 
@@ -248,21 +227,18 @@ def get_modifier_count_by_head(
                 if parse_token["pos"] == "NOUN":
 
                     noun = parse_token["text"]
-                    match = re.match(pattern, noun)
-                    if match:
-                        modifier = match.groups()[0]
-                        head = match.groups()[1]
-                        if wanted_modifier(modifier, word_set):
-                            modifiers_count_by_head[head][modifier] += 1
+                    trie.add(noun)
 
-                            #
-                            doc_label2i.append(doc_label)
-                            modifiers_location_by_head[head][modifier].append(
-                                doc_label2i[doc_label]
-                            )
+                    noun2i[noun].append(i)
+
+    # extract and filter the modifiers for each seed head
+    for seed_head in seed_heads:
+        for modifier in trie.get_prefixes(seed_head):
+            if wanted_modifier(modifier, word_set):
+                noun = modifier + seed_head
+                modifiers_location_by_head[seed_head][modifier] += noun2i[noun]
 
     return (
-        dict(modifiers_count_by_head),
         dict(modifiers_location_by_head),
         doc_label2i.t2i,
     )
@@ -289,7 +265,7 @@ def get_modifiers_star(t) -> set[str]:
 
 def get_modifiers(
     fp: pathlib.Path,
-    seed_pattern: str,
+    seed_heads: list[str],
     pbar_position: int,
 ) -> set[str]:
     """Return a set of modifiers co-occurrent with passed head_patterns, for pos==NOUN
@@ -298,9 +274,10 @@ def get_modifiers(
     terminating hyphens
     """
 
-    returned = set()
+    rev_trie = RevTrie()
+    # i.e., trie of words stored in reverse ...
 
-    # iterate over fp items
+    # build a reverse trie
     fp_items = gen_items([fp])
     for item in tqdm(fp_items, desc=str(pbar_position), position=pbar_position):
 
@@ -314,13 +291,14 @@ def get_modifiers(
                 if parse_token["pos"] == "NOUN":
 
                     noun = parse_token["text"]
+                    rev_trie.add(noun)
 
-                    match = re.match(seed_pattern, noun)
-                    if match:
-                        modifier = match.groups()[0]
-                        returned.add(modifier)
+    # get the modifiers from the rev trie
+    modifiers = set()
+    for seed_head in seed_heads:
+        modifiers = modifiers.union(rev_trie.get_prefixes(seed_head))
 
-    return returned
+    return set(modifiers)
 
 
 def wanted_head(rhs_term, word_set) -> bool:
@@ -345,14 +323,15 @@ def get_heads_star(t):
     return get_heads(*t)
 
 
-def get_heads(fp: pathlib.Path, pattern: str, pbar_position: int) -> set:
+def get_heads(fp: pathlib.Path, seed_modifiers: str, pbar_position: int) -> set:
     """Return a set of heads, for corresponnding modifiers
 
     If ignore_hypen == True, terminating hyphens of any lhs terms are ignored.
     """
 
-    heads = set()
+    trie = Trie()
 
+    # build trie
     fp_items = gen_items([fp])
     for item in tqdm(fp_items, desc=str(pbar_position), position=pbar_position):
 
@@ -366,11 +345,12 @@ def get_heads(fp: pathlib.Path, pattern: str, pbar_position: int) -> set:
                 if parse_token["pos"] == "NOUN":
 
                     noun = parse_token["text"]
+                    trie.add(noun)
 
-                    match = re.match(pattern, noun)
-                    if match:
-                        head = match.groups()[0]
-                        heads.add(head)
+    # get heads
+    heads = set()
+    for seed_modifer in seed_modifiers:
+        heads = heads.union(trie.get_affixes(seed_modifer))
 
     return heads
 
@@ -381,7 +361,7 @@ def gen_items(fps: typing.Iterable[pathlib.Path]) -> typing.Generator:
     for fp in fps:
         with open(fp, "rb") as f:
             for item in ijson.items(f, "item"):
-                    yield item
+                yield item
 
 
 class T2i:
@@ -405,59 +385,98 @@ class T2i:
 
 
 class Trie:
-    # from https://stackoverflow.com/questions/42742810/speed-up-millions-of-regex-replacements-in-python-3
+    """Build a trie and get affixes for some given prefix.
+    
+    E.g., for getting heads for some given modifiers.
+    """
 
     def __init__(self):
-        self.data = {}
+        self.root = dict()
 
-    def add(self, word):
-        ref = self.data
+    def add(self, word: str):
+        """Add word to trie"""
+        ref = self.root
         for char in word:
-            ref[char] = char in ref and ref[char] or {}
+            ref.setdefault(char, {})
             ref = ref[char]
-        ref[""] = 1
 
-    def dump(self):
-        return self.data
+    def get_affixes(self, prefix: str) -> list:
+        """Return a list of all affixes, for given prefix."""
 
-    def _pattern(self, pData):
-        data = pData
-        if "" in data and len(data.keys()) == 1:
-            return None
+        # burn through the prefix ... ending with ref on the whatever comes after the prefix
+        ref = self.root
+        for char in prefix:
+            if char in ref:
+                ref = ref[char]
 
-        alt = []
-        cc = []
-        q = 0
-        for char in sorted(
-            data.keys(), key=lambda x: len(data[x].keys()), reverse=True
-        ):  # sort by most children
-            if isinstance(data[char], dict):
-                try:
-                    recurse = self._pattern(data[char])
-                    alt.append(char + recurse)
-                except:
-                    cc.append(char)
+        acc = []
+        stack = [("", ref)]
+
+        # collect suffices
+        while stack:
+            collected, ref = stack.pop()
+
+            # ref is exhausted, add collected to accumulator
+            if ref == {}:
+                if collected != "":
+                    acc.append(collected)
+                else:
+                    pass
+
+            # still more to collect, add to stack
             else:
-                q = 1
-        cconly = not len(alt) > 0
+                for char in ref.keys():
+                    stack.append((collected + char, ref[char]))
 
-        if len(cc) > 0:
-            if len(cc) == 1:
-                alt.append(cc[0])
+        return acc
+
+
+class RevTrie:
+    """Build a trie (or words in reverse) and get prefixes for some given affix.
+
+    E.g., for getting modifiers for some given heads
+    """
+
+    def __init__(self):
+        self.root = dict()
+
+    def add(self, word: str):
+        """Add (reversed) word to trie.
+        
+            Args:
+                word (str): word in original order
+        """
+        ref = self.root
+        for char in word[::-1]:
+            ref.setdefault(char, {})
+            ref = ref[char]
+
+    def get_prefixes(self, affix: str) -> list:
+        """Return a list of all affixes, for given prefix."""
+
+        # burn through the suffix ... ending with ref on the whatever comes after the suffix
+        ref = self.root
+        for char in affix[::-1]:
+            if char in ref:
+                ref = ref[char]
+
+        acc = []
+        stack = [("", ref)]
+
+        # collect suffices
+        while stack:
+            collected, ref = stack.pop()
+
+            # ref is exhausted, add collected to accumulator
+            if ref == {}:
+                if collected != "":
+                    acc.append(collected)
+                else:
+                    pass
+
+            # still more to collect, add to stack
             else:
-                alt.append("[" + "".join(cc) + "]")
+                for char in ref.keys():
+                    stack.append((collected + char, ref[char]))
 
-        if len(alt) == 1:
-            result = alt[0]
-        else:
-            result = "(?:" + "|".join(alt) + ")"
-
-        if q:
-            if cconly:
-                result += "?"
-            else:
-                result = "(?:%s)?" % result
-        return result
-
-    def pattern(self) -> str:
-        return self._pattern(self.dump())
+        return [reversed_prefix[::-1] for reversed_prefix in acc]

@@ -96,7 +96,6 @@ def main(argv):
                     ignore_pattern=re.compile(r"config\.json"),
                 )
             )
-            print(fps)
 
             ## open wordset of real words
             with open(wordset_fp, "r") as f:
