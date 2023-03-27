@@ -22,9 +22,7 @@ def bootstrap(
     fps: list[pathlib.Path],
     seed_centres: list[str],
     seed_contexts: list[str],
-    contexts_ignore: list[
-        str
-    ],  # only applies to bootstrapped heads, not the modifiers subsequently profiled for bootstrapped heads
+    contexts_ignore: list[str],
     ignore_hyphen: bool,
     n_processes: int,
     output_dir: pathlib.Path,
@@ -58,14 +56,22 @@ def bootstrap(
     """
 
     modifiers_count_by_head = defaultdict(Counter)
-    modifiers_loc_by_head = defaultdict(lambda: defaultdict(list))
+    modifiers_i_by_head_mod = defaultdict(lambda: defaultdict(list))
     loc2i = {}
 
-    ## 1) mine new contexts coincident with passed seed_centre_patterns, and combine with seed_contexts
+    # handle ignore_hypen flag wrt., word_set
+    if ignore_hyphen:
+        word_set = {word.strip("-") for word in word_set}
+
+    # lowercase the word set, since we perform all comparison's ignoring case,
+    # yielding lowercased results for heads and modifiers
+    word_set = {word.lower() for word in word_set}
+
+    ## 1) mine new modifiers, returned as lower-cased
     if len(seed_centres) > 0:
 
         print(f"\tgetting modifiers corresponding to seed head patterns")
-        unmined_modifiers: set[str] = set(seed_contexts).union(
+        bootstrapped_modifiers: set[str] = set(seed_contexts).union(
             *process_map(
                 get_modifiers_star,
                 zip(
@@ -78,16 +84,20 @@ def bootstrap(
         )
 
     else:
-        unmined_modifiers = set(seed_contexts)
+        bootstrapped_modifiers = set(seed_contexts)
+
+    ## handle the ignore-hyphen flag
+    if ignore_hyphen == True:
+        bootstrapped_modifiers = {m.strip("-") for m in bootstrapped_modifiers}
 
     ## 2) filter the modifiers according to general rules
     print("\tfilter modifier list")
     kept_modifiers: set = {
         modifier
-        for modifier in unmined_modifiers
+        for modifier in bootstrapped_modifiers
         if wanted_modifier(modifier, word_set)
     }
-    # remove term in ignore list
+    # remove modifiers in ignore list
     kept_modifiers = {
         modifier for modifier in kept_modifiers if modifier not in contexts_ignore
     }
@@ -101,13 +111,13 @@ def bootstrap(
     save_fp.parent.mkdir(exist_ok=True, parents=True)
     with open(save_fp, "w") as f:
         f.writelines(
-            [modifier + "\n" for modifier in unmined_modifiers - kept_modifiers]
+            [modifier + "\n" for modifier in bootstrapped_modifiers - kept_modifiers]
         )
 
     ## 3) mine new heads, which are coincident with filtered modifiers
     if len(kept_modifiers) > 0:
 
-        # get all heads which match against unmined modifiers
+        # bootstapped heads are all lower-cased
         print(f"\tgetting heads corresponding to modifiers")
         bootstrapped_heads: set = set(seed_centres).union(
             *process_map(
@@ -121,7 +131,11 @@ def bootstrap(
             )
         )
 
-        # filter minded heads
+        ## heads should never have outside hyphens
+        if ignore_hyphen == True:
+            bootstrapped_heads = {head.strip("-") for head in bootstrapped_heads}
+
+        # filter tjne mined heads
         print("\tfilter bootstrapped heads")
         kept_heads: set = {
             head for head in bootstrapped_heads if wanted_head(head, word_set)
@@ -131,14 +145,14 @@ def bootstrap(
         with open(output_dir / "bootstrapped_kept_heads.txt", "w") as f:
             f.writelines([head + "\n" for head in kept_heads])
 
-        with open(output_dir / "bootstrapped__discarded_heads.txt", "w") as f:
+        with open(output_dir / "bootstrapped_discarded_heads.txt", "w") as f:
             f.writelines([head + "\n" for head in bootstrapped_heads - kept_heads])
 
         # 4)  get head->modifier->loc data for set of original seed heads, plus bootstrapped heads
         print(f"\tget dicts")
 
         (
-            modifiers_loc_by_head_iter,  # [{head: {modifier: [0, ...], ...}, ...}, ...]
+            modifiers_i_by_head_mod_iter,  # [{head: {modifier: [0, ...], ...}, ...}, ...]
             loc2i_iter,  # [{"http://kb...": 0, ...}, ...]
         ) = list(
             zip(
@@ -149,46 +163,39 @@ def bootstrap(
                         cycle([kept_heads]),
                         cycle([word_set]),
                         range(len(fps)),
+                        cycle([ignore_hyphen]),
                     ),
                     max_workers=n_processes,
-                    chunksize=1,
                 )
             )
         )
 
-        print(f"\tstitch the dicts")
+        # find i2j
+        i2j = {}
+        j = 0
+        for loc2i_split in loc2i_iter:
+            for loc, i in loc2i_split.items():
+                i2j[i] = i + j
+            j = max(i2j.values())
 
-        # join the modifiers_count_by_head splits
-        modifiers_count_by_head = defaultdict(lambda: defaultdict(int))
-        modifiers_loc_by_head = defaultdict(lambda: defaultdict(list))
+        # make joined loc2i
         loc2i = {}
-        for j, (modifiers_loc_by_head_split, loc2i_split) in enumerate(
-            zip(modifiers_loc_by_head_iter, loc2i_iter)
-        ):
+        seen = set()
+        for loc2i_split in loc2i_iter:
+            for loc, i in loc2i_split.items():
+                assert loc not in seen, "error: articles appear across collections"
+                loc2i[loc] = i2j[i]
 
-            i2loc_split = {i: doc_label for doc_label, i in loc2i_split.items()}
+        # make ... 
+        modifiers_count_by_head_mod = defaultdict(Counter)
+        modifiers_i_by_head_mod = defaultdict(lambda : defaultdict(list))
+        for modifiers_i_by_head_mod_split in modifiers_i_by_head_mod_iter:
+            for head, d in modifiers_i_by_head_mod_split.items():
+                for mod, i_ in d.items():
+                    modifiers_count_by_head_mod[head][mod] += len(i_)
+                    modifiers_i_by_head_mod[head][mod] += [i2j[i] for i in i_]
 
-            for head, modifiers_loc in modifiers_loc_by_head_split.items():
-                for modifier, loc_indices in modifiers_loc.items():
-
-                    for i in loc_indices:
-
-                        doc_label = i2loc_split[i]
-
-                        # reassign i
-                        new_i = j + i
-
-                        # update
-                        loc2i[doc_label] = new_i
-                        modifiers_loc_by_head[head][modifier].append(new_i)
-
-        # build modifiers_count_by_head
-        print("building modifiers_count_by_head")
-        for head in modifiers_loc_by_head.keys():
-            for modifier, locations in modifiers_loc_by_head[head].items():
-                modifiers_count_by_head[head][modifier] += len(locations)
-
-    return (modifiers_count_by_head, modifiers_loc_by_head, loc2i)
+    return (modifiers_count_by_head, modifiers_i_by_head_mod, loc2i)
 
 
 def get_modifiers_by_head_star(t):
@@ -197,19 +204,19 @@ def get_modifiers_by_head_star(t):
 
 def get_modifiers_by_head(
     fp: pathlib.Path,
-    seed_heads: list[str],
+    heads: list[str],
     word_set: set,
     pbar_position: int,
+    ignore_hyphen: bool,
 ):
     """Return tuple of dicts (modifiers_location_by_head, doc_label2i)"""
 
-    modifiers_location_by_head = defaultdict(lambda: defaultdict(list))
+    modifiers_loc_by_head_mod = defaultdict(lambda: defaultdict(list))
     doc_label2i = T2i()
 
     trie = RevTrie()
 
     # build Trie capable of extracting modifiers
-    doc_label2i = T2i()
     noun2i = defaultdict(list)
 
     fp_items = gen_items([fp])
@@ -226,20 +233,28 @@ def get_modifiers_by_head(
 
                 if parse_token["pos"] == "NOUN":
 
-                    noun = parse_token["text"]
+                    noun = parse_token["text"].lower()
                     trie.add(noun)
 
                     noun2i[noun].append(i)
 
     # extract and filter the modifiers for each seed head
-    for seed_head in seed_heads:
+    for seed_head in heads:
         for modifier in trie.get_prefixes(seed_head):
+
+            # handle ignore_hyphen flag
+            if ignore_hyphen:
+                modifier = modifier.strip("-")
+
+            # if seed_head == "negerstam":
+            #     print(modifier, fp.name)
+
             if wanted_modifier(modifier, word_set):
                 noun = modifier + seed_head
-                modifiers_location_by_head[seed_head][modifier] += noun2i[noun]
+                modifiers_loc_by_head_mod[seed_head][modifier] += noun2i[noun]
 
     return (
-        dict(modifiers_location_by_head),
+        dict(modifiers_loc_by_head_mod),
         doc_label2i.t2i,
     )
 
@@ -249,13 +264,9 @@ def wanted_modifier(lhs_term, word_set: set) -> bool:
     if len(lhs_term) < 3:  # ignore modifiers less than 3 chars
         return False
 
-    # check modifier, ignoring hyphen always, is in the word_set
-    if lhs_term[-1] != "-":
-        if lhs_term not in word_set:
-            return False
-    else:
-        if lhs_term[:-1] not in word_set:
-            return False
+    if lhs_term not in word_set:
+        return False
+
     return True
 
 
@@ -270,14 +281,14 @@ def get_modifiers(
 ) -> set[str]:
     """Return a set of modifiers co-occurrent with passed head_patterns, for pos==NOUN
 
-    If ignore_hyphen == True, then lhs terms are reported without
-    terminating hyphens
+    Note: the seed_heads and nouns are lowercased before comparison, hence
+    yielding lower-cased modifiers
     """
 
     rev_trie = RevTrie()
     # i.e., trie of words stored in reverse ...
 
-    # build a reverse trie
+    # build a reverse trie (of lowercased nouns)
     fp_items = gen_items([fp])
     for item in tqdm(fp_items, desc=str(pbar_position), position=pbar_position):
 
@@ -290,13 +301,15 @@ def get_modifiers(
 
                 if parse_token["pos"] == "NOUN":
 
-                    noun = parse_token["text"]
+                    noun = parse_token["text"].lower()
                     rev_trie.add(noun)
 
-    # get the modifiers from the rev trie
+    # get the modifiers from the rev trie wrt., lowercased head
     modifiers = set()
     for seed_head in seed_heads:
-        modifiers = modifiers.union(rev_trie.get_prefixes(seed_head))
+        if seed_head == "opperhoofd":
+            print(rev_trie.get_prefixes(seed_head.lower()))
+        modifiers = modifiers.union(rev_trie.get_prefixes(seed_head.lower()))
 
     return set(modifiers)
 
@@ -309,12 +322,8 @@ def wanted_head(rhs_term, word_set) -> bool:
         return False
 
     # check lhs ignoring hyphen always is in the word_set
-    if rhs_term[-1] != "-":
-        if rhs_term not in word_set:
-            return False
-    else:
-        if rhs_term[:-1] not in word_set:
-            return False
+    if rhs_term not in word_set:
+        return False
 
     return True
 
@@ -326,7 +335,8 @@ def get_heads_star(t):
 def get_heads(fp: pathlib.Path, seed_modifiers: str, pbar_position: int) -> set:
     """Return a set of heads, for corresponnding modifiers
 
-    If ignore_hypen == True, terminating hyphens of any lhs terms are ignored.
+    Note: the seed modifiers and nouns are lowercased before comparison, hence
+    yielding lower-cased heads
     """
 
     trie = Trie()
@@ -344,13 +354,13 @@ def get_heads(fp: pathlib.Path, seed_modifiers: str, pbar_position: int) -> set:
 
                 if parse_token["pos"] == "NOUN":
 
-                    noun = parse_token["text"]
+                    noun = parse_token["text"].lower()
                     trie.add(noun)
 
     # get heads
     heads = set()
     for seed_modifer in seed_modifiers:
-        heads = heads.union(trie.get_affixes(seed_modifer))
+        heads = heads.union(trie.get_affixes(seed_modifer.lower()))
 
     return heads
 
@@ -386,7 +396,7 @@ class T2i:
 
 class Trie:
     """Build a trie and get affixes for some given prefix.
-    
+
     E.g., for getting heads for some given modifiers.
     """
 
@@ -395,10 +405,39 @@ class Trie:
 
     def add(self, word: str):
         """Add word to trie"""
+
+        # add the chars to the trie
         ref = self.root
         for char in word:
-            ref.setdefault(char, {})
-            ref = ref[char]
+            if char in ref:
+                ref = ref[char]
+            else:
+                ref[char] = {}  # create new branch where char is new
+                ref = ref[char]
+
+        # denote the end of a word
+        # i.e., otherwise if wood and woods were added, woods would mask wood
+        ref["<END>"] = True
+
+    def in_whole(self, word: str) -> bool:
+        """Return True if a complete word is in the trie.o
+
+        Note: returns false in the following cases:
+        word = "wood", trie contains "wooden", "driftwood", but not wood.
+        """
+        # burn though the word
+        ref = self.root
+        for char in word:
+            if char in ref:
+                ref = ref[char]
+            else:
+                return False
+
+        # check whether any of the
+        if "<END>" in ref:
+            return True
+        else:
+            return False
 
     def get_affixes(self, prefix: str) -> list:
         """Return a list of all affixes, for given prefix."""
@@ -408,6 +447,10 @@ class Trie:
         for char in prefix:
             if char in ref:
                 ref = ref[char]
+            else:
+                return []  # no affixes
+
+        # collect suffices recursively
 
         acc = []
         stack = [("", ref)]
@@ -416,8 +459,8 @@ class Trie:
         while stack:
             collected, ref = stack.pop()
 
-            # ref is exhausted, add collected to accumulator
-            if ref == {}:
+            # ref is exhausted, add collected to accumulator if not nothing
+            if ref == {"<END>": True}:
                 if collected != "":
                     acc.append(collected)
                 else:
@@ -426,13 +469,14 @@ class Trie:
             # still more to collect, add to stack
             else:
                 for char in ref.keys():
-                    stack.append((collected + char, ref[char]))
+                    if char != "<END>":
+                        stack.append((collected + char, ref[char]))
 
         return acc
 
 
 class RevTrie:
-    """Build a trie (or words in reverse) and get prefixes for some given affix.
+    """Build a trie storing words in reverse.
 
     E.g., for getting modifiers for some given heads
     """
@@ -442,14 +486,21 @@ class RevTrie:
 
     def add(self, word: str):
         """Add (reversed) word to trie.
-        
-            Args:
-                word (str): word in original order
+
+        Args:
+            word (str): word in original order
         """
         ref = self.root
         for char in word[::-1]:
-            ref.setdefault(char, {})
-            ref = ref[char]
+            if char in ref:
+                ref = ref[char]
+            else:
+                ref[char] = {}
+                ref = ref[char]
+
+        # denote the end of a word
+        # i.e., otherwise if wood and woods were added, woods would mask wood
+        ref["<END>"] = True
 
     def get_prefixes(self, affix: str) -> list:
         """Return a list of all affixes, for given prefix."""
@@ -459,6 +510,8 @@ class RevTrie:
         for char in affix[::-1]:
             if char in ref:
                 ref = ref[char]
+            else:
+                return []
 
         acc = []
         stack = [("", ref)]
@@ -468,7 +521,7 @@ class RevTrie:
             collected, ref = stack.pop()
 
             # ref is exhausted, add collected to accumulator
-            if ref == {}:
+            if ref == {"<END>": True}:
                 if collected != "":
                     acc.append(collected)
                 else:
@@ -477,6 +530,7 @@ class RevTrie:
             # still more to collect, add to stack
             else:
                 for char in ref.keys():
-                    stack.append((collected + char, ref[char]))
+                    if char != "<END>":
+                        stack.append((collected + char, ref[char]))
 
         return [reversed_prefix[::-1] for reversed_prefix in acc]

@@ -195,7 +195,7 @@ def gen_dir(
             yield fp
         else:
             # ignore pattern specified, but not met
-            if re.search(ignore_pattern, str(fp)):
+            if re.search(ignore_pattern, str(fp.name)):
                 pass
             else:
                 yield fp
